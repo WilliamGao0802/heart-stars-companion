@@ -1,0 +1,4 @@
+# 心与星寻 · 陪伴版依赖
+# streamlit 出界面，requests 调云端 API（登录 / 对话 / 记忆）。
+streamlit>=1.40
+requests>=2.31

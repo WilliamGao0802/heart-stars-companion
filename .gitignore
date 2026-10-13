@@ -1,0 +1,15 @@
+# 虚拟环境与缓存（绝不入库）
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 本地密钥（绝不入库；云端配在 Streamlit Secrets）
+.streamlit/secrets.toml
+
+# 杂项
+_dist/
+*.log
+.DS_Store
