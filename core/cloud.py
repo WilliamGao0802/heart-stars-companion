@@ -18,6 +18,7 @@ streamlit.app 不在白名单里会被 403），而服务端 Python 发出的请
 import json
 import re
 import time
+from urllib.parse import urlencode
 
 import requests
 
@@ -26,6 +27,22 @@ from .config import ENDPOINT, PUBLISHABLE_KEY
 EXPIRY_BUFFER_MS = 60 * 1000   # 提前 1 分钟算过期，避免边界 401
 _TIMEOUT = 30
 _LLM_TIMEOUT = 180
+
+# ---- PostgREST 入参白名单 ----------------------------------------------------
+# 风险：表名、列名、order 都是**直接拼进 URL 路径/查询串**的。只要有一个调用点
+#   把用户输入透进来，就能构造出 table=&or=(...) 这类越权查询（PostgREST 的
+#   过滤语法本身就是「可编程」的），甚至换一张表读别人的数据。
+# 做法：表名只认我们自己的业务表；列名只认标识符；值一律 urlencode。
+_TABLES = {
+    "chat_messages", "diary_entries", "lamp_entries", "user_profiles",
+    "user_memory", "chat_library", "admin_alerts", "user_bindings", "analytics_events",
+}
+_RPC_FNS = {
+    "admin_stats", "admin_users", "admin_user_detail",
+    "admin_alerts_list", "admin_alert_update", "admin_library",
+    "admin_ping", "admin_metrics",
+}
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
 
 class CloudError(Exception):
@@ -44,6 +61,37 @@ def normalize_phone(phone):
     elif local.startswith("86") and len(local) == 13:
         local = local[2:]
     return ("+86 " + local) if re.fullmatch(r"1\d{10}", local) else str(phone or "")
+
+
+def _table(name):
+    t = str(name or "")
+    if t not in _TABLES:
+        raise CloudError("表名不在允许范围内", "bad_table")
+    return t
+
+
+def _col(name):
+    c = str(name or "")
+    if not _IDENT_RE.match(c):
+        raise CloudError("列名不合法", "bad_column")
+    return c
+
+
+def _order(expr):
+    parts = str(expr or "").split(".")
+    if len(parts) == 2 and parts[1] in ("asc", "desc"):
+        return _col(parts[0]) + "." + parts[1]
+    if len(parts) == 1:
+        return _col(parts[0])
+    raise CloudError("排序表达式不合法", "bad_sort")
+
+
+def _qs(params, extra=None):
+    """把查询参数编码成查询串：key 走白名单，value 一律百分号编码。"""
+    pairs = [(_col(k), str(v)) for k, v in (params or {}).items()]
+    if extra:
+        pairs.extend(extra)
+    return urlencode(pairs)
 
 
 class Session:
@@ -86,8 +134,10 @@ class CloudClient:
         h = {"x-wb-webapp-access-key": PUBLISHABLE_KEY}
         if with_auth and self.session.access_token:
             h["Authorization"] = "Bearer " + self.session.access_token
-        if self.admin_key:
-            h["x-admin-key"] = self.admin_key
+        # 注意：这里**不放** x-admin-key。云网关不会透传自定义请求头（实测
+        #   current_setting('request.headers') 为空），放上去既无效、又会让
+        #   管理密钥出现在每一个普通请求的 header 里，白白扩大暴露面。
+        #   管理员鉴权统一走 rpc() 的请求体参数 p_key。
         if extra:
             h.update(extra)
         return h
@@ -204,14 +254,16 @@ class CloudClient:
     # ---------------- 数据（PostgREST） ----------------
 
     def db_select(self, table, params=None, limit=100, order=None):
-        q = []
-        if params:
-            for k, v in params.items():
-                q.append("%s=%s" % (k, v))
+        t = _table(table)
+        extra = []
         if order:
-            q.append("order=" + order)
-        q.append("limit=%d" % limit)
-        url = "%s/.cloud/database/rest/%s?%s" % (ENDPOINT, table, "&".join(q))
+            extra.append(("order", _order(order)))
+        try:
+            limit = max(1, min(int(limit), 1000))
+        except (TypeError, ValueError):
+            limit = 100
+        extra.append(("limit", str(limit)))
+        url = "%s/.cloud/database/rest/%s?%s" % (ENDPOINT, t, _qs(params, extra))
         try:
             r = self._http.get(url, headers=self._headers({"Accept": "application/json"}), timeout=_TIMEOUT)
         except requests.RequestException as e:
@@ -226,11 +278,8 @@ class CloudClient:
 
     def db_count(self, table, params=None):
         """用 PostgREST 的 count 精确计数。"""
-        q = ["select=*"]
-        if params:
-            for k, v in params.items():
-                q.append("%s=%s" % (k, v))
-        url = "%s/.cloud/database/rest/%s?%s" % (ENDPOINT, table, "&".join(q))
+        t = _table(table)
+        url = "%s/.cloud/database/rest/%s?%s" % (ENDPOINT, t, _qs(params, [("select", "*")]))
         try:
             r = self._http.get(url, headers=self._headers({
                 "Accept": "application/json",
@@ -249,7 +298,8 @@ class CloudClient:
         return -1
 
     def db_insert(self, table, rows):
-        url = "%s/.cloud/database/rest/%s" % (ENDPOINT, table)
+        t = _table(table)
+        url = "%s/.cloud/database/rest/%s" % (ENDPOINT, t)
         try:
             r = self._http.post(url, data=json.dumps(rows),
                                 headers=self._headers({"Content-Type": "application/json",
@@ -262,10 +312,8 @@ class CloudClient:
         raise CloudError(self._err_text(r), self._err_code(r))
 
     def db_update(self, table, params, patch):
-        q = []
-        for k, v in (params or {}).items():
-            q.append("%s=%s" % (k, v))
-        url = "%s/.cloud/database/rest/%s?%s" % (ENDPOINT, table, "&".join(q))
+        t = _table(table)
+        url = "%s/.cloud/database/rest/%s?%s" % (ENDPOINT, t, _qs(params))
         try:
             r = self._http.patch(url, data=json.dumps(patch),
                                  headers=self._headers({"Content-Type": "application/json",
@@ -279,23 +327,23 @@ class CloudClient:
 
     def db_upsert(self, table, params, row):
         """有则更新、无则插入（供 memory 用）。"""
+        t = _table(table)
         try:
-            existing = self.db_select(table, params, limit=1)
+            existing = self.db_select(t, params, limit=1)
         except CloudError:
             existing = []
         if existing:
-            return self.db_update(table, params, row)
+            return self.db_update(t, params, row)
         payload = dict(row)
         for k, v in (params or {}).items():
+            v = str(v)
             if v.startswith("eq."):
                 payload[k] = v[3:]
-        return self.db_insert(table, payload)
+        return self.db_insert(t, payload)
 
     def db_delete(self, table, params):
-        q = []
-        for k, v in (params or {}).items():
-            q.append("%s=%s" % (k, v))
-        url = "%s/.cloud/database/rest/%s?%s" % (ENDPOINT, table, "&".join(q))
+        t = _table(table)
+        url = "%s/.cloud/database/rest/%s?%s" % (ENDPOINT, t, _qs(params))
         try:
             r = self._http.delete(url, headers=self._headers({"Accept": "application/json"}), timeout=_TIMEOUT)
         except requests.RequestException as e:
@@ -313,6 +361,8 @@ class CloudClient:
         （实测 current_setting('request.headers') 为空），所以「x-admin-key 头 +
         RLS 策略」这条路走不通；把密钥放进**请求体参数**里就稳了，函数内部校验密钥。
         """
+        if fn_name not in _RPC_FNS:
+            raise CloudError("RPC 不在允许范围内", "bad_rpc")
         url = "%s/.cloud/database/rest/rpc/%s" % (ENDPOINT, fn_name)
         try:
             r = self._http.post(url, data=json.dumps(params),

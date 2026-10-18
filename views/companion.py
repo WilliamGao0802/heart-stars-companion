@@ -8,6 +8,7 @@
   · 登录用「手机号 + 密码」（桌面浏览器拿不到微信授权，微信绑定仍只在手机端）。
 """
 
+import html
 import os
 import time
 
@@ -17,12 +18,24 @@ from core import avatar as av
 from core import chatflow, companion, safety
 from core import memory as memmod
 from core import moodcurve
-from core.cloud import CloudClient, CloudError, Session, memory_cloud
+from core.cloud import CloudClient, CloudError, memory_cloud
 
-VERSION = "1.0.0"
+VERSION = "1.0.2"
 GATE_SECONDS = int(os.environ.get("HSX_GATE_SECONDS", "300"))
 SOURCE = "st"
 AVATAR_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "avatars")
+
+
+def _esc(v):
+    """把任意值转成可安全放进 unsafe_allow_html 的 HTML 文本。
+
+    为什么每个动态值都要过这一层：日记正文、长期记忆里的 facts/goals/asks
+    都是**用户或模型写的自由文本**，直接拼进 st.markdown(..., unsafe_allow_html=True)
+    就是存储型 XSS —— 一句 <img src=x onerror=...> 就能在这个域里执行脚本。
+    换行转 <br> 是为了保住原来的排版观感。
+    """
+    s = html.escape(str(v if v is not None else ""), quote=True)
+    return s.replace("\r\n", "\n").replace("\n", "<br>")
 
 
 # ============================ 会话初始化 ============================
@@ -45,14 +58,10 @@ def _boot():
         ss.font_scale = 1.0
     if "page" not in ss:
         ss.page = "对话"
-    # 刷新页面后用 URL 里的 refresh token 恢复登录（「不用反复登录」）
-    if not ss.cloud.session.access_token:
-        rt = st.query_params.get("rt")
-        if rt:
-            ss.cloud.session = Session(refresh_token=rt, expires_at=0)
-            ss.cloud.ensure()
-            if not ss.cloud.session.access_token:
-                st.query_params.clear()
+    # 登录状态**只**放在 st.session_state（服务端会话）里。
+    # 曾经为了「刷新后不用重新登录」把 refresh_token 写进 URL 的 ?rt= 参数，
+    # 那是把长期凭据交给浏览器历史、访问日志和 Referer —— 等于可被接管账号。
+    # 现在：刷新/关页即退出，公共电脑上更安全；要留住登录，重新输一次手机号即可。
 
 
 def _store():
@@ -181,7 +190,7 @@ def _generate(prompt, placeholder):
 def _render_gate():
     st.markdown('<div class="card"><h4>免费体验时间到啦</h4>'
                 '<p>你已经陪星寻聊了一会儿了。注册一下，星寻才能记住你——下次打开，它还认得。</p>'
-                '<p class="kv">用手机号注册即可，登录信息会保存在本地，不用反复登录。</p></div>',
+                '<p class="kv">用手机号注册即可。登录状态只保留在当前这次浏览里，关掉页面就会退出（公共电脑上更安全）。</p></div>',
                 unsafe_allow_html=True)
     with st.form("gate_login", clear_on_submit=False):
         phone = st.text_input("手机号", placeholder="13800000000")
@@ -215,7 +224,6 @@ def _do_login(phone, pwd):
 
 def _on_login_ok():
     st.session_state.pending_signup = None
-    st.query_params["rt"] = st.session_state.cloud.session.refresh_token or ""
     store = _store()
     res = store.sync_cloud(store.load())
     if res.get("memory"):
@@ -370,7 +378,8 @@ def _render_recent():
     for it in reversed(items[-8:]):
         face = moodcurve.mood_face(it.get("mood", "")) or "·"
         st.markdown('<div class="card"><p>%s %s</p><p class="kv">%s</p></div>'
-                    % (face, (it.get("content") or "（只记了心情）"), time.strftime("%m-%d %H:%M", time.localtime((it.get("ts") or 0) / 1000))),
+                    % (face, _esc(it.get("content") or "（只记了心情）"),
+                       time.strftime("%m-%d %H:%M", time.localtime((it.get("ts") or 0) / 1000))),
                     unsafe_allow_html=True)
 
 
@@ -383,14 +392,14 @@ def _page_mine():
     if _signed_in():
         uid = ss.cloud.auth_uid()
         st.markdown('<div class="card"><h4>已登录</h4><p class="kv">ID：%s</p><p class="kv">%s</p></div>'
-                    % (uid, ss.cloud.session.phone or "手机号账号"), unsafe_allow_html=True)
+                    % (_esc(uid), _esc(ss.cloud.session.phone or "手机号账号")), unsafe_allow_html=True)
         if st.button("退出登录"):
             ss.cloud.sign_out()
             st.query_params.clear()
             st.rerun()
     else:
         st.markdown('<div class="card"><p>还没登录——登录后星寻才能跨设备记住你。</p>'
-                    '<p class="kv">手机号 + 密码即可；登录状态会保存在本地，不用反复登录。</p></div>', unsafe_allow_html=True)
+                    '<p class="kv">手机号 + 密码即可；登录状态只保留在当前这次浏览里，关掉页面就会退出。</p></div>', unsafe_allow_html=True)
         with st.form("mine_login"):
             phone = st.text_input("手机号", key="mine_phone", placeholder="13800000000")
             pwd = st.text_input("密码", type="password", key="mine_pwd")
@@ -421,19 +430,20 @@ def _page_mine():
         st.markdown('<div class="card"><p>还是一片空白。聊过几次、星寻记住了东西之后，这里会长出来。</p></div>', unsafe_allow_html=True)
     else:
         p = mem["profile"]
+        # 这些字段来自「用户原话 + 模型总结」，一律转义后再进 HTML。
         rows = []
         if p["call"]:
-            rows.append("习惯怎么称呼你：<b>%s</b>" % p["call"])
+            rows.append("习惯怎么称呼你：<b>%s</b>" % _esc(p["call"]))
         if p["facts"]:
-            rows.append("记得的事：%s" % "；".join(p["facts"]))
+            rows.append("记得的事：%s" % "；".join(_esc(x) for x in p["facts"]))
         if p["matters"]:
-            rows.append("你放不下的：%s" % "、".join(p["matters"]))
+            rows.append("你放不下的：%s" % "、".join(_esc(x) for x in p["matters"]))
         if p["goals"]:
-            rows.append("你想做的：%s" % "；".join(p["goals"]))
+            rows.append("你想做的：%s" % "；".join(_esc(x) for x in p["goals"]))
         if p["asks"]:
-            rows.append("你要求过星寻的：%s" % "；".join(p["asks"]))
+            rows.append("你要求过星寻的：%s" % "；".join(_esc(x) for x in p["asks"]))
         if mem["mood"]["tone"]:
-            rows.append("最近的状态：%s" % mem["mood"]["tone"])
+            rows.append("最近的状态：%s" % _esc(mem["mood"]["tone"]))
         st.markdown('<div class="card"><h4>共 %d 轮对话</h4>%s</div>'
                     % (mem["count"]["turns"], "".join('<p>%s</p>' % r for r in rows)), unsafe_allow_html=True)
         if st.button("让星寻忘掉这些"):
