@@ -41,6 +41,7 @@ _RPC_FNS = {
     "admin_stats", "admin_users", "admin_user_detail",
     "admin_alerts_list", "admin_alert_update", "admin_library",
     "admin_ping", "admin_metrics",
+    "admin_turn_distribution", "admin_hour_distribution",
 }
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
@@ -379,6 +380,57 @@ class CloudClient:
         if r.status_code == 404:
             raise CloudError("管理接口不存在（数据库函数未创建）", "no_rpc")
         raise CloudError(self._err_text(r), self._err_code(r))
+
+    # ---------------- 埋点（四端同一张表 analytics_events） ----------------
+
+    # 口径与 packages/core/src/metrics.js 的 METRIC_EVENTS 保持一致：
+    #   只认 9 类事件，非白名单事件直接丢弃；props 只收 string/number。
+    # 为什么要复制一份白名单而不是共享：Python 与 JS 不能共享常量文件，
+    #   但两份必须**逐字一致**——改了这边就要改那边，单测里有对应断言。
+    METRIC_EVENTS = {
+        "app_open", "chat_turn", "diary_create",
+        "crisis_l2", "crisis_l3",
+        "referral_hotline", "referral_emergency", "referral_school", "referral_guardian",
+    }
+    _PROP_MAX = 120
+
+    def track(self, event, props=None, platform="st"):
+        """上报一条埋点。**fire-and-forget**：任何异常都不抛出。
+
+        为什么永不抛：埋点是辅助观测，绝不能因为埋点失败而阻断用户写日记或聊天。
+        这也是四端一致的约定（JS 侧 metrics.js 同样 catch 全吞）。
+
+        行结构照抄 buildEvent：event / user_id / platform / day / props。
+        user_id 由客户端**显式传**（数据库列是 text，默认值兜底为 'anonymous'），
+        与三端 analytic_events 的行长得一模一样，后台才不用写两套解析。
+        """
+        e = str(event or "")
+        if e not in self.METRIC_EVENTS:
+            return False
+        clean = {}
+        for k, v in list((props or {}).items())[:8]:
+            key = str(k)[:32]
+            if not key:
+                continue
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                clean[key] = v
+            elif isinstance(v, str):
+                clean[key] = v[:self._PROP_MAX]
+        t = time.localtime()
+        row = {
+            "event": e,
+            "user_id": str(self.auth_uid() or "anonymous")[:64] or "anonymous",
+            "platform": str(platform or "st")[:8],
+            "day": "%d-%d-%d" % (t.tm_year, t.tm_mon, t.tm_mday),
+            "props": clean,
+        }
+        try:
+            self.db_insert("analytics_events", [row])
+            return True
+        except CloudError:
+            return False
 
     # ---------------- 大模型 ----------------
 
